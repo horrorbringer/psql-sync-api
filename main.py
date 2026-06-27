@@ -55,7 +55,7 @@ import logging
 import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Any, Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException
@@ -145,6 +145,33 @@ class SyncRequest(BaseModel):
     # Ignore saved incremental cursors for this source/destination pair and
     # copy all selected tables again. Use after rebuilding the destination.
     full_resync: bool = False
+
+
+class SyncErrorItem(BaseModel):
+    code: str
+    table: Optional[str] = None
+    pk_value: Any = None
+    message: str
+    details: dict[str, Any] = {}
+
+
+class SyncResponseData(BaseModel):
+    tables: Optional[list[dict[str, Any]]] = None
+    plan: Optional[list[dict[str, Any]]] = None
+
+
+class SyncResponse(BaseModel):
+    success: bool
+    mode: str
+    full_resync: bool
+    auto_full_resync: bool
+    message: str
+    data: SyncResponseData
+    errors: list[SyncErrorItem]
+    summary: Optional[list[dict[str, Any]]] = None
+    dry_run: Optional[bool] = None
+    plan: Optional[list[dict[str, Any]]] = None
+
 
 # --- lightweight embedded state, separate from both Postgres databases ---
 META_DB_PATH = os.getenv("SYNC_META_DB_PATH", "sync_meta.db")
@@ -566,7 +593,12 @@ def upsert_rows(conn, table: str, pk: str, rows: list[dict]):
     return synced, errors
 
 
-@app.post("/api/sync")
+@app.post(
+    "/api/sync",
+    response_model=SyncResponse,
+    tags=["Sync"],
+    summary="Run database sync",
+)
 def sync_server_to_local(
     payload: Optional[SyncRequest] = None,
     x_api_key: Optional[str] = Header(default=None),
