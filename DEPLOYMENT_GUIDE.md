@@ -14,16 +14,17 @@ The API reads selected tables from the source, discovers their foreign-key paren
 2. Recommended hosting model
 3. Network and security rules
 4. Config precedence
-5. VM setup
-6. System service
-7. Production updates with Git
-8. Production config updates
-9. Recommended auto deployment
-10. Subdomain and HTTPS
-11. First sync
-12. Normal incremental sync
-13. Operating rules
-14. Known current limitations
+5. Local development run
+6. VM setup
+7. System service
+8. Production updates with Git
+9. Production config updates
+10. Recommended auto deployment
+11. Subdomain and HTTPS
+12. First sync
+13. Normal incremental sync
+14. Operating rules
+15. Known current limitations
 
 ## Recommended hosting model
 
@@ -82,6 +83,62 @@ Production recommendation:
 - keep real credentials only in `.env`
 - do not send DB configs in the request body unless you are intentionally doing an override
 - keep `ALLOWED_DB_HOSTS` populated if overrides are enabled at all
+
+## Local development run
+
+Use this when you want to run the FastAPI app from your laptop or workstation.
+
+```bash
+cd /Users/vanny/development/sync_data_psql
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -r requirements.txt
+cp env.example .env
+```
+
+Edit `.env` and fill in the database and API key values. For local development, keep the API's own SQLite state in the project folder:
+
+```dotenv
+SYNC_META_DB_PATH=sync_meta.db
+SYNC_LOCK_FILE=/tmp/db_sync_api.lock
+SYNC_API_KEY=replace-with-a-local-test-key
+```
+
+Start the API:
+
+```bash
+.venv/bin/uvicorn main:app --host 127.0.0.1 --port 8000 --reload
+```
+
+Open the generated API docs:
+
+```text
+http://127.0.0.1:8000/docs
+```
+
+Run a dry-run request before copying rows:
+
+```bash
+curl --fail-with-body http://127.0.0.1:8000/api/sync \
+  -H "X-API-Key: replace-with-a-local-test-key" \
+  -H "Content-Type: application/json" \
+  --data '{"tables":["custom_form_entries"],"dry_run":true}'
+```
+
+Run a normal incremental sync:
+
+```bash
+curl --fail-with-body http://127.0.0.1:8000/api/sync \
+  -H "X-API-Key: replace-with-a-local-test-key" \
+  -H "Content-Type: application/json" \
+  --data '{"tables":["custom_form_entries"]}'
+```
+
+Important local notes:
+
+- `localhost` in a request means the machine running the API. If the API runs on your laptop, local DB hosts must be reachable from your laptop.
+- Supabase or other hosted PostgreSQL endpoints can be used from local development when the credentials, firewall rules, and `sslmode=require` are correct.
+- Do not commit `.env`, `sync_meta.db`, or real database credentials.
 
 ## VM setup (Ubuntu example)
 

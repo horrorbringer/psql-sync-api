@@ -540,11 +540,12 @@ def fetch_rows(conn, table: str, where: str | None, updated_at_col: str | None, 
         if where:
             conditions.append(sql.SQL(where))
         if updated_at_col and since_ts is not None:
-            # OR IS NULL: a row with no updated_at would otherwise never
-            # match "> since_ts" and be permanently invisible after the
-            # first run.
+            # After a table has a cursor, only rows that moved past the
+            # cursor should be fetched. Rows with NULL updated_at are copied
+            # during the first baseline fetch, but including them forever
+            # makes every incremental run re-upsert the same old rows.
             conditions.append(
-                sql.SQL("({col} > %s OR {col} IS NULL)").format(col=sql.Identifier(updated_at_col))
+                sql.SQL("{col} > %s").format(col=sql.Identifier(updated_at_col))
             )
             params.append(since_ts)
 
