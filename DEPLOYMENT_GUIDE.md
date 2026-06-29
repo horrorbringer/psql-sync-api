@@ -642,7 +642,7 @@ Use these fields in the caller UI:
 - `mode`: show whether the run was `dry_run`, `incremental`, or `full_resync`
 - `auto_full_resync`: show a note that the API repaired an empty/reset target automatically
 - `message`: display this directly to non-technical users
-- `data.tables`: table-level fetched/synced/error counts
+- `data.tables`: table-level counts. `fetched` means rows read from the source, `synced` means rows inserted or changed in the target, and `unchanged` means rows already matched the target.
 - `errors`: machine-readable list for logs, support screens, or admin details
 
 For button UX, disable the sync button and show a spinner while the HTTP request is pending. When the response returns, hide the spinner and display `message`.
@@ -662,11 +662,12 @@ curl --fail-with-body https://sync.example.com/api/sync/history \
 - Back up `/var/lib/db_sync_api/sync_meta.db`. It holds sync cursors and history.
 - Alert on failed runs, repeated `409` responses, source/target connection failures, and tables skipped because a parent failed.
 - Keep source and target schema migrations coordinated. The API discovers FK order, but it cannot repair a target that is missing a required table or column.
+- Large parent tables should have a server-controlled incremental column. In the current config, `source_entries` uses `created_at` as an append-only cursor because it has no usable `updated_at`; use this only for tables where old rows are not edited after creation.
 
 ## Known current limitations
 
 - Deletes are not replicated. A row that stops matching `review_status = 'passed'` remains in the target until deletion/reconciliation is implemented.
 - Composite primary keys are not yet supported.
 - Circular and self-referencing foreign keys are rejected until a two-phase or deferred-constraint strategy is added.
-- Parent tables are currently synced as complete tables. A future optimization can backfill only parent IDs referenced by selected child rows.
+- Parent tables without a configured/valid incremental column are still synced as complete tables. This is acceptable for small lookup tables, but large parent tables should expose `updated_at` or be explicitly configured with a safe append-only cursor.
 - The current design is single-instance. To scale horizontally, move cursor state into a shared database and replace the file lock with a distributed lock.

@@ -99,6 +99,10 @@ DEFAULT_SYNC_TABLES = ("custom_form_entries",)
 # a request body. Tables not listed here are synced without a row filter.
 SYNC_TABLE_OPTIONS = {
     "custom_form_entries": {"where": "review_status = 'passed'"},
+    # Large FK parent table. It does not expose a usable updated_at in the
+    # current schema, so treat created_at as an append-only incremental cursor.
+    # Do not use created_at for tables where existing rows are edited later.
+    "source_entries": {"updated_at_col": "created_at"},
 }
 
 # --- security: required now that callers can specify which DB to connect to ---
@@ -558,25 +562,47 @@ def fetch_rows(conn, table: str, where: str | None, updated_at_col: str | None, 
 
 def upsert_rows(conn, table: str, pk: str, rows: list[dict]):
     if not rows:
-        return 0, []
+        return 0, 0, []
 
     columns = list(rows[0].keys())
     update_cols = [c for c in columns if c != pk]
 
-    insert_stmt = sql.SQL(
-        "INSERT INTO {table} ({cols}) VALUES ({vals}) "
-        "ON CONFLICT ({pk}) DO UPDATE SET {updates}"
-    ).format(
-        table=sql.Identifier(table),
-        cols=sql.SQL(", ").join(sql.Identifier(c) for c in columns),
-        vals=sql.SQL(", ").join(sql.Placeholder() for _ in columns),
-        pk=sql.Identifier(pk),
-        updates=sql.SQL(", ").join(
-            sql.SQL("{c} = EXCLUDED.{c}").format(c=sql.Identifier(c)) for c in update_cols
-        ),
-    )
+    if update_cols:
+        insert_stmt = sql.SQL(
+            "INSERT INTO {table} ({cols}) VALUES ({vals}) "
+            "ON CONFLICT ({pk}) DO UPDATE SET {updates} "
+            "WHERE ({target_cols}) IS DISTINCT FROM ({excluded_cols})"
+        ).format(
+            table=sql.Identifier(table),
+            cols=sql.SQL(", ").join(sql.Identifier(c) for c in columns),
+            vals=sql.SQL(", ").join(sql.Placeholder() for _ in columns),
+            pk=sql.Identifier(pk),
+            updates=sql.SQL(", ").join(
+                sql.SQL("{c} = EXCLUDED.{c}").format(c=sql.Identifier(c)) for c in update_cols
+            ),
+            target_cols=sql.SQL(", ").join(
+                sql.SQL("{table}.{column}").format(
+                    table=sql.Identifier(table),
+                    column=sql.Identifier(c),
+                )
+                for c in update_cols
+            ),
+            excluded_cols=sql.SQL(", ").join(
+                sql.SQL("EXCLUDED.{column}").format(column=sql.Identifier(c)) for c in update_cols
+            ),
+        )
+    else:
+        insert_stmt = sql.SQL(
+            "INSERT INTO {table} ({cols}) VALUES ({vals}) "
+            "ON CONFLICT ({pk}) DO NOTHING"
+        ).format(
+            table=sql.Identifier(table),
+            cols=sql.SQL(", ").join(sql.Identifier(c) for c in columns),
+            vals=sql.SQL(", ").join(sql.Placeholder() for _ in columns),
+            pk=sql.Identifier(pk),
+        )
 
-    synced, errors = 0, []
+    synced, unchanged, errors = 0, 0, []
     for row in rows:
         # dict/list values (e.g. the JSONB `data` column) need wrapping for psycopg2
         values = [Json(v) if isinstance(v, (dict, list)) else v for v in (row[c] for c in columns)]
@@ -584,14 +610,17 @@ def upsert_rows(conn, table: str, pk: str, rows: list[dict]):
         try:
             cur.execute(insert_stmt, values)
             conn.commit()
-            synced += 1
+            if cur.rowcount:
+                synced += 1
+            else:
+                unchanged += 1
         except Exception as e:
             conn.rollback()
             errors.append({"pk_value": row.get(pk), "error": str(e)})
         finally:
             cur.close()
 
-    return synced, errors
+    return synced, unchanged, errors
 
 
 @app.post(
@@ -722,7 +751,7 @@ def sync_server_to_local(
                 failed_tables.add(step["table"])
                 continue
 
-            synced, errors = upsert_rows(local_conn, step["table"], step["pk"], rows)
+            synced, unchanged, errors = upsert_rows(local_conn, step["table"], step["pk"], rows)
 
             if errors:
                 success = False
@@ -736,7 +765,10 @@ def sync_server_to_local(
 
             summary.append({
                 "table": step["table"], "fetched": len(rows),
-                "synced": synced, "errors": errors,
+                "synced": synced,
+                "unchanged": unchanged,
+                "incremental_column": updated_at_col,
+                "errors": errors,
             })
 
         logger.info(f"Sync finished, success={success}, summary={summary}")
