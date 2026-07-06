@@ -48,7 +48,10 @@ tables are included. Table-specific business filters live in
 SYNC_TABLE_OPTIONS below, because PostgreSQL metadata cannot infer them.
 """
 
-import fcntl
+try:
+    import fcntl
+except ImportError:
+    fcntl = None  # Windows
 import hashlib
 import json
 import logging
@@ -373,8 +376,16 @@ def sync_response(
     return response
 
 
+class _LockSentinel:
+    """Returned when OS locking is unavailable (Windows). Always truthy."""
+    pass
+
+
 def acquire_lock():
     """Plain OS file lock -- works across processes/workers, no DB needed to check it."""
+    if fcntl is None:
+        logger.warning("fcntl not available (Windows) -- skipping lock")
+        return _LockSentinel()
     fd = open(LOCK_FILE_PATH, "w")
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -385,7 +396,7 @@ def acquire_lock():
 
 
 def release_lock(fd):
-    if fd:
+    if fd and fcntl is not None:
         fcntl.flock(fd, fcntl.LOCK_UN)
         fd.close()
 
@@ -571,14 +582,14 @@ def upsert_rows(conn, table: str, pk: str, rows: list[dict]):
                 sql.SQL("{c} = EXCLUDED.{c}").format(c=sql.Identifier(c)) for c in update_cols
             ),
             target_cols=sql.SQL(", ").join(
-                sql.SQL("{table}.{column}").format(
+                sql.SQL("{table}.{column}::text").format(
                     table=sql.Identifier(table),
                     column=sql.Identifier(c),
                 )
                 for c in update_cols
             ),
             excluded_cols=sql.SQL(", ").join(
-                sql.SQL("EXCLUDED.{column}").format(column=sql.Identifier(c)) for c in update_cols
+                sql.SQL("EXCLUDED.{column}::text").format(column=sql.Identifier(c)) for c in update_cols
             ),
         )
     else:
