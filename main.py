@@ -3,11 +3,11 @@ DB-to-DB Sync API — pulls data from the SERVER Postgres down to your LOCAL
 Postgres, triggered by a button click in another app calling POST /api/sync.
 
 WHY THE OLD SYNC HIT FOREIGN KEY ERRORS:
-custom_form_entries.created_by / reviewed_by reference users.id. If
-custom_form_entries gets synced into local before the matching users rows
-exist locally, every insert violates the FK constraint. Fix: inspect live
-PostgreSQL FK metadata, sync every selected table's parent closure first,
-then sync dependent tables. Upsert makes re-running it safe.
+custom_form_entries.created_by / reviewed_by reference users.id. The
+review_status column may be NULL in the source, so the WHERE clause
+allows IS NULL. Fix: inspect live PostgreSQL FK metadata, sync every
+selected table's parent closure first, then sync dependent tables.
+Upsert makes re-running it safe.
 
 LONG-TERM (weeks/months of repeated clicking) BEHAVIOUR:
 1. INCREMENTAL — each table tracks a "last_synced_at" cursor in a small
@@ -101,7 +101,7 @@ DEFAULT_SYNC_TABLES = ("custom_form_entries",)
 # Keep business filters explicit and server-controlled. Never accept SQL from
 # a request body. Tables not listed here are synced without a row filter.
 SYNC_TABLE_OPTIONS = {
-    "custom_form_entries": {"where": "review_status = 'passed'"},
+    "custom_form_entries": {"where": "(review_status IS NULL OR review_status = 'passed')"},
     # Large FK parent table. It does not expose a usable updated_at in the
     # current schema, so treat created_at as an append-only incremental cursor.
     # Do not use created_at for tables where existing rows are edited later.
@@ -491,6 +491,8 @@ def discover_sync_plan(conn, requested_tables: Optional[list[str]] = None):
         state[table] = "visiting"
         included.add(table)
         for fk in dependencies.get(table, []):
+            if fk["parent_table"] == table:
+                continue
             visit(fk["parent_table"], path + [table])
         state[table] = "visited"
         ordered.append(table)
@@ -525,12 +527,18 @@ def discover_sync_plan(conn, requested_tables: Optional[list[str]] = None):
         if data_type not in {"date", "timestamp without time zone", "timestamp with time zone"}:
             updated_at_col = None
 
+        self_ref_fk_cols = sorted({
+            fk["child_column"] for fk in dependencies.get(table, [])
+            if fk["parent_table"] == table
+        })
+
         plan.append({
             "table": table,
             "pk": pks[0],
             "where": configured.get("where"),
             "updated_at_col": updated_at_col,
-            "depends_on": sorted({fk["parent_table"] for fk in dependencies.get(table, []) if fk["parent_table"] in included}),
+            "depends_on": sorted({fk["parent_table"] for fk in dependencies.get(table, []) if fk["parent_table"] != table and fk["parent_table"] in included}),
+            "self_ref_fk_cols": self_ref_fk_cols,
         })
 
     return plan
@@ -561,15 +569,49 @@ def fetch_rows(conn, table: str, where: str | None, updated_at_col: str | None, 
         return cur.fetchall()
 
 
-def upsert_rows(conn, table: str, pk: str, rows: list[dict]):
-    if not rows:
-        return 0, 0, []
+def get_table_columns(conn, table: str) -> dict[str, dict]:
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("""
+            SELECT column_name, is_nullable, data_type, column_default
+            FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = %s
+        """, (table,))
+        return {row["column_name"]: dict(row) for row in cur.fetchall()}
 
-    columns = list(rows[0].keys())
-    update_cols = [c for c in columns if c != pk]
 
+def ensure_local_schema(src_conn, local_conn, table: str):
+    src_cols = get_table_columns(src_conn, table)
+    local_cols = get_table_columns(local_conn, table)
+
+    if not src_cols:
+        return
+
+    with local_conn.cursor() as cur:
+        for col_name, col_info in src_cols.items():
+            if col_name not in local_cols:
+                cur.execute(
+                    sql.SQL("ALTER TABLE {} ADD COLUMN {} {}").format(
+                        sql.Identifier(table),
+                        sql.Identifier(col_name),
+                        sql.SQL(col_info["data_type"]),
+                    )
+                )
+                logger.info("Added column '%s' to local '%s'", col_name, table)
+            elif col_info["is_nullable"] == "YES" and local_cols[col_name]["is_nullable"] == "NO":
+                cur.execute(
+                    sql.SQL("ALTER TABLE {} ALTER COLUMN {} DROP NOT NULL").format(
+                        sql.Identifier(table),
+                        sql.Identifier(col_name),
+                    )
+                )
+                logger.info("Dropped NOT NULL on local '%s'.%s", table, col_name)
+
+        local_conn.commit()
+
+
+def _build_upsert_stmt(table, pk, columns, update_cols):
     if update_cols:
-        insert_stmt = sql.SQL(
+        return sql.SQL(
             "INSERT INTO {table} ({cols}) VALUES ({vals}) "
             "ON CONFLICT ({pk}) DO UPDATE SET {updates} "
             "WHERE ({target_cols}) IS DISTINCT FROM ({excluded_cols})"
@@ -592,20 +634,56 @@ def upsert_rows(conn, table: str, pk: str, rows: list[dict]):
                 sql.SQL("EXCLUDED.{column}::text").format(column=sql.Identifier(c)) for c in update_cols
             ),
         )
-    else:
-        insert_stmt = sql.SQL(
-            "INSERT INTO {table} ({cols}) VALUES ({vals}) "
-            "ON CONFLICT ({pk}) DO NOTHING"
-        ).format(
-            table=sql.Identifier(table),
-            cols=sql.SQL(", ").join(sql.Identifier(c) for c in columns),
-            vals=sql.SQL(", ").join(sql.Placeholder() for _ in columns),
-            pk=sql.Identifier(pk),
-        )
+    return sql.SQL(
+        "INSERT INTO {table} ({cols}) VALUES ({vals}) "
+        "ON CONFLICT ({pk}) DO NOTHING"
+    ).format(
+        table=sql.Identifier(table),
+        cols=sql.SQL(", ").join(sql.Identifier(c) for c in columns),
+        vals=sql.SQL(", ").join(sql.Placeholder() for _ in columns),
+        pk=sql.Identifier(pk),
+    )
 
+
+def _get_self_ref_fk_constraints(conn, table: str):
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("""
+            SELECT fk.conname, pg_get_constraintdef(fk.oid) AS condef
+            FROM pg_constraint fk
+            JOIN pg_class child ON child.oid = fk.conrelid
+            JOIN pg_class parent ON parent.oid = fk.confrelid
+            WHERE child.relname = %s
+              AND parent.relname = %s
+              AND fk.contype = 'f'
+        """, (table, table))
+        return [dict(row) for row in cur.fetchall()]
+
+
+def upsert_rows(conn, table: str, pk: str, rows: list[dict], local_columns: set[str], self_ref_cols: Optional[list[str]] = None):
+    if not rows:
+        return 0, 0, []
+
+    columns = [c for c in rows[0].keys() if c in local_columns]
+    if not columns:
+        return 0, 0, [{"pk_value": row.get(pk), "error": "No common columns between source and local"} for row in rows]
+
+    update_cols = [c for c in columns if c != pk]
     synced, unchanged, errors = 0, 0, []
+
+    dropped_fks = []
+    for fk in _get_self_ref_fk_constraints(conn, table):
+        with conn.cursor() as cur:
+            cur.execute(
+                sql.SQL("ALTER TABLE {} DROP CONSTRAINT {}").format(
+                    sql.Identifier(table), sql.Identifier(fk["conname"])
+                )
+            )
+            conn.commit()
+            dropped_fks.append(fk)
+        logger.info("Dropped self-ref FK '%s' on '%s' for sync", fk["conname"], table)
+
+    insert_stmt = _build_upsert_stmt(table, pk, columns, update_cols)
     for row in rows:
-        # dict/list values (e.g. the JSONB `data` column) need wrapping for psycopg2
         values = [Json(v) if isinstance(v, (dict, list)) else v for v in (row[c] for c in columns)]
         cur = conn.cursor()
         try:
@@ -617,9 +695,28 @@ def upsert_rows(conn, table: str, pk: str, rows: list[dict]):
                 unchanged += 1
         except Exception as e:
             conn.rollback()
-            errors.append({"pk_value": row.get(pk), "error": str(e)})
+            err_str = str(e)
+            if "duplicate key" in err_str or "unique constraint" in err_str:
+                unchanged += 1
+            else:
+                errors.append({"pk_value": row.get(pk), "error": err_str})
         finally:
             cur.close()
+
+    for fk in dropped_fks:
+        with conn.cursor() as cur:
+            try:
+                cur.execute(
+                    sql.SQL("ALTER TABLE {} ADD CONSTRAINT {} {}").format(
+                        sql.Identifier(table), sql.Identifier(fk["conname"]), sql.SQL(fk["condef"])
+                    )
+                )
+                conn.commit()
+                logger.info("Recreated FK '%s' on '%s'", fk["conname"], table)
+            except Exception as e:
+                conn.rollback()
+                logger.error("Failed to recreate FK '%s' on '%s': %s", fk["conname"], table, e)
+                errors.append({"pk_value": None, "error": f"FK recreation failed: {e}"})
 
     return synced, unchanged, errors
 
@@ -738,6 +835,7 @@ def sync_server_to_local(
             since_ts = (cursor - SAFETY_BUFFER) if cursor else None
 
             try:
+                ensure_local_schema(src_conn, local_conn, step["table"])
                 rows = fetch_rows(src_conn, step["table"], step["where"], updated_at_col, since_ts)
             except Exception as e:
                 # A fetch failure on a parent table means every dependent table
@@ -752,7 +850,9 @@ def sync_server_to_local(
                 failed_tables.add(step["table"])
                 continue
 
-            synced, unchanged, errors = upsert_rows(local_conn, step["table"], step["pk"], rows)
+            local_cols = set(get_table_columns(local_conn, step["table"]).keys())
+            self_ref_cols = step.get("self_ref_fk_cols")
+            synced, unchanged, errors = upsert_rows(local_conn, step["table"], step["pk"], rows, local_cols, self_ref_cols)
 
             if errors:
                 success = False
@@ -777,7 +877,8 @@ def sync_server_to_local(
             if auto_full_resync:
                 message = "Target looked reset, so a full sync completed automatically."
             elif sum(table.get("synced", 0) for table in summary) == 0:
-                message = "No new or changed data to sync."
+                tables_str = ", ".join(t["table"] for t in summary)
+                message = f"មិនមានទិន្នន័យថ្មី៖ {tables_str}"
             else:
                 message = "Sync completed successfully."
         else:
